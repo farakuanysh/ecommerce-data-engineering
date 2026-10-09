@@ -1,4 +1,5 @@
 import csv
+import logging
 import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -10,18 +11,29 @@ from dotenv import load_dotenv
 # Project paths
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CSV_PATH = PROJECT_ROOT / "data" / "raw" / "products.csv"
+LOG_DIR = PROJECT_ROOT / "logs"
+LOG_DIR.mkdir(exist_ok=True)
 
-# Load database credentials from .env
+# Logging to console and file
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_DIR / "etl.log", encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+# Load database settings
 load_dotenv(PROJECT_ROOT / ".env")
 
 
 def extract_data():
-    """Read and validate products from CSV."""
+    """Read and validate product data from CSV."""
 
     if not CSV_PATH.exists():
         raise FileNotFoundError(f"CSV file not found: {CSV_PATH}")
-
-    rows = []
 
     required_columns = {
         "product_name",
@@ -29,6 +41,8 @@ def extract_data():
         "price",
         "stock_quantity",
     }
+
+    rows = []
 
     with CSV_PATH.open(
         "r", encoding="utf-8-sig", newline=""
@@ -53,12 +67,19 @@ def extract_data():
                 )
 
             try:
-                price = Decimal(row["price"])
-                stock_quantity = int(row["stock_quantity"])
+                price = Decimal((row["price"] or "").strip())
+                stock_quantity = int(
+                    (row["stock_quantity"] or "").strip()
+                )
             except (InvalidOperation, TypeError, ValueError) as error:
                 raise ValueError(
                     f"Invalid price or quantity at line {line_number}"
                 ) from error
+
+            if not price.is_finite():
+                raise ValueError(
+                    f"Invalid price at line {line_number}"
+                )
 
             if price < 0 or stock_quantity < 0:
                 raise ValueError(
@@ -72,12 +93,12 @@ def extract_data():
     if not rows:
         raise ValueError("CSV contains no product rows")
 
-    print(f"EXTRACT: read {len(rows)} products from CSV.")
+    logger.info("EXTRACT: read %s products from CSV", len(rows))
     return rows
 
 
 def load_and_transform(rows):
-    """Load staging data, transform it in SQL, and load analytics data."""
+    """Load staging data, transform it, and load analytics data."""
 
     required_env = [
         "DB_HOST",
@@ -91,9 +112,11 @@ def load_and_transform(rows):
 
     if missing:
         raise ValueError(
-            f"Missing environment variables in .env: {', '.join(missing)}"
+            f"Missing settings in .env: {', '.join(missing)}"
         )
 
+    # Exiting the connection context commits the transaction
+    # if all database operations succeed.
     with psycopg.connect(
         host=os.getenv("DB_HOST"),
         port=int(os.getenv("DB_PORT")),
@@ -104,7 +127,6 @@ def load_and_transform(rows):
 
         with connection.cursor() as cursor:
 
-            # Create the staging table if it does not exist.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS stg_products (
                     staging_id BIGSERIAL PRIMARY KEY,
@@ -119,7 +141,6 @@ def load_and_transform(rows):
                 );
             """)
 
-            # Create the analytics table if it does not exist.
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS analytics_products (
                     source_staging_id BIGINT PRIMARY KEY,
@@ -144,8 +165,7 @@ def load_and_transform(rows):
                 );
             """)
 
-            # Full refresh of staging data.
-            # RESTART IDENTITY resets staging_id for this CSV snapshot.
+            # Full refresh of the staging table.
             cursor.execute(
                 "TRUNCATE TABLE stg_products RESTART IDENTITY;"
             )
@@ -163,9 +183,7 @@ def load_and_transform(rows):
             cursor.execute("SELECT COUNT(*) FROM stg_products;")
             staging_count = cursor.fetchone()[0]
 
-            print(f"LOAD: inserted {staging_count} rows into staging.")
-
-            # Transform and fully refresh the analytics table.
+            # Full refresh of the analytics table.
             cursor.execute("TRUNCATE TABLE analytics_products;")
 
             cursor.execute("""
@@ -200,24 +218,30 @@ def load_and_transform(rows):
             )
             analytics_count = cursor.fetchone()[0]
 
-    # The database transaction has committed successfully here.
-    print(
-        f"TRANSFORM + LOAD: {analytics_count} rows "
-        "written to analytics_products."
+    # These messages are logged after the transaction commits.
+    logger.info("LOAD: inserted %s rows into staging", staging_count)
+    logger.info(
+        "TRANSFORM + LOAD: %s rows written to analytics_products",
+        analytics_count,
     )
 
     return staging_count, analytics_count
 
 
 def main():
-    rows = extract_data()
+    logger.info("ETL pipeline started")
 
-    staging_count, analytics_count = load_and_transform(rows)
+    try:
+        rows = extract_data()
+        staging_count, analytics_count = load_and_transform(rows)
 
-    print()
-    print("ETL PIPELINE FINISHED SUCCESSFULLY")
-    print(f"Staging rows:   {staging_count}")
-    print(f"Analytics rows: {analytics_count}")
+        logger.info("ETL PIPELINE FINISHED SUCCESSFULLY")
+        logger.info("Staging rows: %s", staging_count)
+        logger.info("Analytics rows: %s", analytics_count)
+
+    except Exception:
+        logger.exception("ETL pipeline failed")
+        raise
 
 
 if __name__ == "__main__":
